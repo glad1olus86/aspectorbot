@@ -323,16 +323,19 @@ class QueueManager:
                     logger.info(f"Задача отправлена пользователю")
                     return
                 else:
-                    logger.warning(f"Gemini не смог сформировать задачу, отправляем только расшифровку")
+                    logger.warning(f"Gemini не смог сформировать задачу, отправляем ошибку")
+                    await self._send_gemini_error(task, result["text"], photo_file_ids)
+                    return
             except Exception as e:
                 logger.error(f"Ошибка при вызове Gemini: {e}")
-                # При ошибке просто отправляем расшифровку
                 try:
                     await generating_msg.delete()
                 except Exception:
                     pass
+                await self._send_gemini_error(task, result["text"], photo_file_ids)
+                return
 
-        # Fallback: если Gemini не настроен или ошибка — отправляем только расшифровку
+        # Fallback: если Gemini не настроен — отправляем только расшифровку
         text = get_success_message(
             text=result["text"],
             lang=task.lang or "unknown",
@@ -398,7 +401,7 @@ class QueueManager:
             pass
 
         if not edited_card_data:
-            await self._send_error(task)
+            await self._send_gemini_error(task, result["text"], original_card_data.get("photo_file_ids", []))
             return
 
         # Сохраняем фото файлы из оригинала
@@ -419,9 +422,33 @@ class QueueManager:
             reply_markup=keyboard,
         )
 
+    async def _send_gemini_error(self, task: VoiceTask, text: str, photo_file_ids: list[str]) -> None:
+        """
+        Отправить сообщение об ошибке генерации Gemini вместе с кнопкой повтора.
+        """
+        from bot.handlers.trello import store_failed_task
+        from bot.keyboards import create_retry_keyboard
+
+        failed_id = store_failed_task({
+            "text": text,
+            "photo_file_ids": photo_file_ids,
+            "action": task.action,
+            "action_data": task.action_data
+        })
+
+        try:
+            await self.bot.send_message(
+                chat_id=task.chat_id,
+                text=get_trello_error_message(),
+                reply_to_message_id=task.message_id,
+                reply_markup=create_retry_keyboard(failed_id)
+            )
+        except TelegramBadRequest as e:
+            logger.error(f"Не удалось отправить ошибку Gemini: {e}")
+
     async def _send_error(self, task: VoiceTask) -> None:
         """
-        Отправить сообщение об ошибке.
+        Отправить сообщение об ошибке (STT или система).
 
         Args:
             task: Задача

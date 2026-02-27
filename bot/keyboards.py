@@ -114,9 +114,26 @@ def create_empty_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[])
 
 
+def create_retry_keyboard(failed_id: str) -> InlineKeyboardMarkup:
+    """
+    Создать клавиатуру с кнопкой повтора после ошибки генерации.
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔄 Повторить генерацию",
+                    callback_data=f"retry_gemini:{failed_id}"
+                )
+            ]
+        ]
+    )
+
+
 __all__ = [
     "create_language_keyboard",
     "create_empty_keyboard",
     "create_trello_confirm_keyboard",
     "create_trello_edit_cancel_keyboard",
+    "create_retry_keyboard",
 ]

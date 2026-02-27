@@ -27,6 +27,7 @@ router = Router(name="trello")
 
 # In-memory хранилища
 _pending_cards: dict[str, dict] = {}  # {card_id: {"title": ..., "description": ..., "photo_file_ids": [...]}}
+_failed_tasks: dict[str, dict] = {}   # {failed_id: {"text": ..., "photo_file_ids": [...], "action": ..., "action_data": ...}}
 
 
 class TrelloState(StatesGroup):
@@ -43,6 +44,13 @@ def _store_card(card_data: dict) -> str:
     card_id = uuid.uuid4().hex[:8]
     _pending_cards[card_id] = card_data
     return card_id
+
+
+def store_failed_task(task_data: dict) -> str:
+    """Сохранить данные провалившейся генерации задачи для повтора."""
+    failed_id = uuid.uuid4().hex[:8]
+    _failed_tasks[failed_id] = task_data
+    return failed_id
 
 
 def _get_card(card_id: str) -> dict | None:
@@ -77,6 +85,80 @@ async def trello_card_cancel_callback(callback: CallbackQuery, state: FSMContext
     await callback.message.edit_reply_markup(reply_markup=create_empty_keyboard())
     await callback.answer()
     logger.info(f"Задача отменена: card_id={card_id}")
+
+
+@router.callback_query(F.data.startswith("retry_gemini:"))
+async def retry_gemini_callback(callback: CallbackQuery) -> None:
+    """
+    Повторная попытка сгенерировать карточку, если Gemini выдал ошибку.
+    """
+    failed_id = callback.data.split(":")[1]
+    task_data = _failed_tasks.get(failed_id)
+    
+    if not task_data:
+        await callback.answer("⏳ Данные устарели, запишите аудио заново.", show_alert=True)
+        return
+
+    # Убираем кнопку повтора
+    await callback.message.edit_reply_markup(reply_markup=create_empty_keyboard())
+    
+    # Сообщение о генерации
+    generating_msg = await callback.message.reply(get_trello_generating_message())
+    
+    import asyncio
+    
+    # В зависимости от типа действия
+    if task_data.get("action") == "edit":
+        card_id = task_data.get("action_data", {}).get("card_id")
+        orig_card = _get_card(card_id) if card_id else None
+        if not orig_card:
+            await generating_msg.delete()
+            await callback.answer("⏳ Исходная задача устарела.", show_alert=True)
+            return
+            
+        card_data = await asyncio.to_thread(edit_trello_card, orig_card, task_data["text"])
+        if card_data:
+            # Восстанавливаем фото из сохраненных провалившихся данных
+            card_data["photo_file_ids"] = task_data.get("photo_file_ids", [])
+            _pending_cards[card_id] = card_data
+            
+            await generating_msg.delete()
+            await callback.message.reply(
+                get_trello_card_message(card_data["title"], card_data["description"]),
+                reply_markup=create_trello_confirm_keyboard(card_id),
+            )
+            _failed_tasks.pop(failed_id, None)
+            await callback.answer("Успешно!")
+        else:
+            from bot.keyboards import create_retry_keyboard
+            await generating_msg.delete()
+            await callback.message.reply(
+                get_trello_error_message(),
+                reply_markup=create_retry_keyboard(failed_id)
+            )
+            await callback.answer("Снова ошибка Gemini")
+    else:
+        # Стандартное создание
+        card_data = await asyncio.to_thread(generate_trello_card, task_data["text"])
+        
+        await generating_msg.delete()
+        if card_data:
+            card_data["photo_file_ids"] = task_data.get("photo_file_ids", [])
+            card_id = _store_card(card_data)
+            
+            await callback.message.reply(
+                get_trello_card_message(card_data["title"], card_data["description"]),
+                reply_markup=create_trello_confirm_keyboard(card_id),
+            )
+            _failed_tasks.pop(failed_id, None)
+            await callback.answer("Успешно!")
+        else:
+            from bot.keyboards import create_retry_keyboard
+            await callback.message.reply(
+                get_trello_error_message(),
+                reply_markup=create_retry_keyboard(failed_id)
+            )
+            await callback.answer("Снова ошибка Gemini")
 
 
 # === Основные обработчики ===
@@ -316,4 +398,4 @@ async def trello_edits_voice(message: Message, state: FSMContext) -> None:
     # Остаёмся в состоянии ожидания
 
 
-__all__ = ["router", "TrelloState", "_store_card"]
+__all__ = ["router", "TrelloState", "_store_card", "store_failed_task"]
