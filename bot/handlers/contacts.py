@@ -16,6 +16,9 @@ class ContactState(StatesGroup):
     waiting_for_name = State()
     waiting_for_username = State()
     waiting_for_triggers = State()
+    editing_name = State()
+    editing_username = State()
+    editing_triggers = State()
 
 
 def _build_contacts_keyboard(owner_id: int, page: int = 0) -> InlineKeyboardMarkup:
@@ -141,10 +144,14 @@ async def contact_view_callback(callback: CallbackQuery) -> None:
     
     buttons = [
         [
+            InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"contact_edit:{contact_id}"),
+            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"contact_delete:{contact_id}"),
+        ],
+        [
             InlineKeyboardButton(text="🔙 К списку контактов", callback_data="contacts_page:0")
-        ]
+        ],
     ]
-    
+
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await callback.answer()
 
@@ -315,6 +322,208 @@ async def process_contact_triggers(message: Message, state: FSMContext) -> None:
             await message.answer(text, reply_markup=keyboard)
     else:
         await message.answer(text, reply_markup=keyboard)
+
+
+# === Удаление контакта ===
+
+
+@router.callback_query(F.data.startswith("contact_delete:"))
+async def contact_delete_callback(callback: CallbackQuery) -> None:
+    """Подтверждение удаления контакта."""
+    contact_id = callback.data.split(":")[1]
+    user_id = callback.from_user.id
+
+    contact = contacts_store.get_contact(user_id, contact_id)
+    if not contact:
+        await callback.answer("❌ Контакт не найден", show_alert=True)
+        return
+
+    text = f"🗑 Удалить контакт <b>{contact.name}</b> (@{contact.username})?"
+    buttons = [
+        [
+            InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"contact_delete_confirm:{contact_id}"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data=f"contact_view:{contact_id}"),
+        ]
+    ]
+
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("contact_delete_confirm:"))
+async def contact_delete_confirm_callback(callback: CallbackQuery) -> None:
+    """Фактическое удаление контакта."""
+    contact_id = callback.data.split(":")[1]
+    user_id = callback.from_user.id
+
+    contacts_store.delete_contact(user_id, contact_id)
+
+    text = "🗓 <b>Ваши контакты</b>\n\n🗑 Контакт удалён."
+    keyboard = _build_contacts_keyboard(user_id, 0)
+
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+
+# === Редактирование контакта (FSM) ===
+
+
+@router.callback_query(F.data.startswith("contact_edit:"))
+async def contact_edit_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    """Начало редактирования контакта."""
+    contact_id = callback.data.split(":")[1]
+    user_id = callback.from_user.id
+
+    contact = contacts_store.get_contact(user_id, contact_id)
+    if not contact:
+        await callback.answer("❌ Контакт не найден", show_alert=True)
+        return
+
+    await state.set_state(ContactState.editing_name)
+    await state.update_data(
+        edit_contact_id=contact_id,
+        menu_message_id=callback.message.message_id,
+    )
+
+    triggers_str = ", ".join(contact.trigger_words) if contact.trigger_words else "—"
+    text = (
+        f"✏️ <b>Редактирование контакта</b>\n\n"
+        f"Текущие данные:\n"
+        f"Имя: {contact.name}\n"
+        f"Username: @{contact.username}\n"
+        f"Триггеры: {triggers_str}\n\n"
+        f"Введите новое <b>имя</b> (или <code>.</code> чтобы оставить прежнее):"
+    )
+    buttons = [[InlineKeyboardButton(text="❌ Отмена", callback_data=f"contact_view:{contact_id}")]]
+
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.answer()
+
+
+@router.message(ContactState.editing_name)
+async def process_edit_name(message: Message, state: FSMContext) -> None:
+    """Обработка нового имени при редактировании."""
+    raw = message.text.strip()
+    data = await state.get_data()
+    contact_id = data["edit_contact_id"]
+    user_id = message.from_user.id
+    contact = contacts_store.get_contact(user_id, contact_id)
+
+    new_name = contact.name if raw == "." else raw
+    await state.update_data(edit_name=new_name)
+    await state.set_state(ContactState.editing_username)
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    menu_message_id = data.get("menu_message_id")
+    text = (
+        f"✏️ <b>Редактирование контакта</b>\n"
+        f"Имя: {new_name}\n\n"
+        f"Введите новый <b>username</b> (или <code>.</code> чтобы оставить @{contact.username}):"
+    )
+    buttons = [[InlineKeyboardButton(text="❌ Отмена", callback_data=f"contact_view:{contact_id}")]]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    if menu_message_id:
+        try:
+            await message.bot.edit_message_text(
+                chat_id=message.chat.id, message_id=menu_message_id,
+                text=text, reply_markup=keyboard,
+            )
+            return
+        except Exception:
+            pass
+    msg = await message.answer(text, reply_markup=keyboard)
+    await state.update_data(menu_message_id=msg.message_id)
+
+
+@router.message(ContactState.editing_username)
+async def process_edit_username(message: Message, state: FSMContext) -> None:
+    """Обработка нового username при редактировании."""
+    raw = message.text.strip()
+    data = await state.get_data()
+    contact_id = data["edit_contact_id"]
+    user_id = message.from_user.id
+    contact = contacts_store.get_contact(user_id, contact_id)
+
+    new_username = contact.username if raw == "." else raw
+    await state.update_data(edit_username=new_username)
+    await state.set_state(ContactState.editing_triggers)
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    triggers_str = ", ".join(contact.trigger_words) if contact.trigger_words else "—"
+    menu_message_id = data.get("menu_message_id")
+    text = (
+        f"✏️ <b>Редактирование контакта</b>\n"
+        f"Имя: {data['edit_name']}\n"
+        f"Username: {new_username}\n\n"
+        f"Введите новые <b>триггер-слова</b> через запятую "
+        f"(или <code>.</code> чтобы оставить: {triggers_str}):"
+    )
+    buttons = [[InlineKeyboardButton(text="❌ Отмена", callback_data=f"contact_view:{contact_id}")]]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    if menu_message_id:
+        try:
+            await message.bot.edit_message_text(
+                chat_id=message.chat.id, message_id=menu_message_id,
+                text=text, reply_markup=keyboard,
+            )
+            return
+        except Exception:
+            pass
+    msg = await message.answer(text, reply_markup=keyboard)
+    await state.update_data(menu_message_id=msg.message_id)
+
+
+@router.message(ContactState.editing_triggers)
+async def process_edit_triggers(message: Message, state: FSMContext) -> None:
+    """Обработка новых триггер-слов и сохранение."""
+    raw = message.text.strip()
+    data = await state.get_data()
+    contact_id = data["edit_contact_id"]
+    user_id = message.from_user.id
+    contact = contacts_store.get_contact(user_id, contact_id)
+
+    if raw == ".":
+        new_triggers = contact.trigger_words
+    else:
+        new_triggers = [w.strip() for w in raw.split(",") if w.strip()]
+
+    contacts_store.update_contact(
+        user_id, contact_id,
+        name=data["edit_name"],
+        username=data["edit_username"],
+        trigger_words=new_triggers,
+    )
+    await state.clear()
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    menu_message_id = data.get("menu_message_id")
+    text = "🗓 <b>Ваши контакты</b>\n\n✅ Контакт обновлён."
+    keyboard = _build_contacts_keyboard(user_id, 0)
+
+    if menu_message_id:
+        try:
+            await message.bot.edit_message_text(
+                chat_id=message.chat.id, message_id=menu_message_id,
+                text=text, reply_markup=keyboard,
+            )
+            return
+        except Exception:
+            pass
+    await message.answer(text, reply_markup=keyboard)
 
 
 __all__ = ["router"]

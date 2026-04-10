@@ -125,6 +125,30 @@ class ContactsStore:
                 })
         return result
 
+    def delete_contact(self, owner_id: int, contact_id: str) -> bool:
+        """Удалить контакт. Возвращает True если найден и удалён."""
+        owner_str = str(owner_id)
+        contacts = self._data.get(owner_str, [])
+        for i, c in enumerate(contacts):
+            if c.id == contact_id:
+                contacts.pop(i)
+                self._save()
+                logger.info(f"Контакт {contact_id} удалён для owner={owner_id}")
+                return True
+        return False
+
+    def update_contact(self, owner_id: int, contact_id: str, name: str, username: str, trigger_words: list[str]) -> bool:
+        """Обновить контакт. Возвращает True если найден и обновлён."""
+        contact = self.get_contact(owner_id, contact_id)
+        if not contact:
+            return False
+        contact.name = name
+        contact.username = username.lstrip("@")
+        contact.trigger_words = [w.strip().lower() for w in trigger_words if w.strip()]
+        self._save()
+        logger.info(f"Контакт {contact_id} обновлён: {name} (@{contact.username})")
+        return True
+
     def increment_stats(self, owner_id: int, contact_id: str) -> None:
         """Увеличить счетчик отправленных задач (tasks_sent) на 1."""
         contact = self.get_contact(owner_id, contact_id)
