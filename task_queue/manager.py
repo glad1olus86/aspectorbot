@@ -9,17 +9,14 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
 from loguru import logger
 
-from bot.keyboards import create_language_keyboard, create_trello_confirm_keyboard
+from bot.keyboards import create_trello_confirm_keyboard
 from bot.handlers.trello import _store_card
-from bot.messages import get_error_message, get_pending_language_message, get_success_message, get_trello_card_message, get_trello_generating_message, get_trello_error_message
+from bot.messages import get_error_message, get_success_message, get_trello_card_message, get_trello_generating_message, get_trello_error_message
 from config import config
 from task_queue.task import TaskStatus, VoiceTask
-from stt.lang_detector import language_detector
 from stt.recognizer import recognizer
-from storage.pending import pending_store
-from storage.user_lang import user_lang_store
 from storage.user_photos import user_photo_store
-from utils.audio import cleanup_audio_file, ogg_to_wav
+from utils.audio import cleanup_audio_file
 
 
 class QueueManager:
@@ -27,7 +24,7 @@ class QueueManager:
     Менеджер очереди задач обработки голосовых сообщений.
 
     Запускает N воркеров которые параллельно обрабатывают задачи.
-    Использует семафор для ограничения параллельных распознаваний Vosk.
+    Аудио отправляется напрямую в Groq API (whisper-large-v3).
     """
 
     def __init__(self, bot: Bot) -> None:
@@ -39,14 +36,10 @@ class QueueManager:
         """
         self.bot = bot
         self.queue: asyncio.Queue[VoiceTask] = asyncio.Queue()
-        self._semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_RECOGNITION)
         self._workers: list[asyncio.Task] = []
         self._running = False
 
-        logger.info(
-            f"QueueManager инициализирован: воркеров={config.WORKER_COUNT}, "
-            f"max_concurrent={config.MAX_CONCURRENT_RECOGNITION}"
-        )
+        logger.info(f"QueueManager инициализирован: воркеров={config.WORKER_COUNT}")
 
     async def start(self) -> None:
         """Запустить воркеры очереди."""
@@ -101,18 +94,13 @@ class QueueManager:
 
         while self._running:
             try:
-                # Получаем задачу из очереди
                 task = await self.queue.get()
 
                 if not self._running:
                     break
 
                 logger.debug(f"Воркер {worker_id} взял задачу {task.task_id}")
-
-                # Обрабатываем задачу
                 await self._process_task(task, worker_id)
-
-                # Помечаем задачу как выполненную
                 self.queue.task_done()
 
             except asyncio.CancelledError:
@@ -132,69 +120,34 @@ class QueueManager:
             worker_id: ID воркера
         """
         start_time = time.time()
+        ogg_path = None
 
         try:
             task.set_status(TaskStatus.PROCESSING)
 
-            # Ограничиваем параллельные распознавания
-            async with self._semaphore:
-                # Скачиваем файл
-                logger.info(f"[{worker_id}] Загрузка файла для {task.task_id}")
-                ogg_path = await self._download_file(task.file_id)
+            # Скачиваем файл
+            logger.info(f"[{worker_id}] Загрузка файла для {task.task_id}")
+            ogg_path = await self._download_file(task.file_id)
 
-                try:
-                    # Конвертируем в WAV
-                    logger.info(f"[{worker_id}] Конвертация в WAV: {task.task_id}")
-                    wav_path = await ogg_to_wav(ogg_path, config.TEMP_DIR / f"{task.task_id}.wav")
-                    task.set_wav_path(str(wav_path))
+            # Распознаём через Groq API (OGG напрямую, без конвертации)
+            logger.info(f"[{worker_id}] Распознавание через Groq: {task.task_id}")
+            result = await asyncio.to_thread(recognizer.recognize_sync, ogg_path)
 
-                    # Определяем язык если не указан
-                    if task.lang is None:
-                        # Проверяем предпочтение пользователя
-                        if task.user_id:
-                            user_pref = user_lang_store.get(task.user_id)
-                            if user_pref:
-                                task.lang = user_pref
-                                logger.info(f"[{worker_id}] Язык из предпочтений: {user_pref} (user={task.user_id})")
+            processing_time = time.time() - start_time
 
-                    if task.lang is None:
-                        logger.info(f"[{worker_id}] Определение языка: {task.task_id}")
-                        task.lang = await language_detector.detect(wav_path)
-
-                        if task.lang is None:
-                            # Не удалось определить язык
-                            logger.info(f"[{worker_id}] Язык не определён: {task.task_id}")
-                            await self._handle_pending_language(task)
-                            return
-
-                    # Распознаём речь
-                    logger.info(f"[{worker_id}] Распознавание ({task.lang}): {task.task_id}")
-                    result = await recognizer.recognize(wav_path, task.lang)
-
-                    processing_time = time.time() - start_time
-
-                    if result.get("text"):
-                        # Успех
-                        logger.info(
-                            f"[{worker_id}] Успех: {task.task_id} -> '{result['text'][:50]}...'"
-                            if len(result["text"]) > 50
-                            else f"[{worker_id}] Успех: {task.task_id} -> '{result['text']}'"
-                        )
-                        logger.info(f"[{worker_id}] Вызов _send_result для {task.task_id}")
-                        await self._send_result(task, result, processing_time)
-                        logger.info(f"[{worker_id}] _send_result завершён, установка статуса DONE")
-                        task.set_status(TaskStatus.DONE)
-                    else:
-                        # Пустой результат
-                        logger.warning(f"[{worker_id}] Пустой результат: {task.task_id}")
-                        await self._send_error(task)
-                        task.set_status(TaskStatus.FAILED)
-
-                finally:
-                    # Очищаем временные файлы
-                    await cleanup_audio_file(ogg_path)
-                    if task.wav_path:
-                        await cleanup_audio_file(task.wav_path)
+            if result.get("text"):
+                task.lang = result.get("lang", "")
+                logger.info(
+                    f"[{worker_id}] Успех: {task.task_id} -> '{result['text'][:50]}...'"
+                    if len(result["text"]) > 50
+                    else f"[{worker_id}] Успех: {task.task_id} -> '{result['text']}'"
+                )
+                await self._send_result(task, result, processing_time)
+                task.set_status(TaskStatus.DONE)
+            else:
+                logger.warning(f"[{worker_id}] Пустой результат: {task.task_id}")
+                await self._send_error(task)
+                task.set_status(TaskStatus.FAILED)
 
         except Exception as e:
             logger.error(f"[{worker_id}] Ошибка обработки {task.task_id}: {e}")
@@ -203,6 +156,10 @@ class QueueManager:
                 await self._send_error(task)
             except Exception as send_error:
                 logger.error(f"Не удалось отправить ошибку: {send_error}")
+        finally:
+            # Очищаем временный файл
+            if ogg_path:
+                await cleanup_audio_file(ogg_path)
 
     async def _download_file(self, file_id: str) -> Path:
         """
@@ -222,40 +179,11 @@ class QueueManager:
 
         return file_path
 
-    async def _handle_pending_language(self, task: VoiceTask) -> None:
-        """
-        Обработать задачу с неопределённым языком.
-
-        Отправляет сообщение с кнопками выбора языка и сохраняет задачу в PendingStore.
-
-        Args:
-            task: Задача
-        """
-        # Сохраняем в PendingStore
-        pending_store.store(task)
-
-        # Отправляем сообщение с кнопками
-        text = get_pending_language_message()
-        keyboard = create_language_keyboard(task.task_id)
-
-        try:
-            await self.bot.send_message(
-                chat_id=task.chat_id,
-                text=text,
-                reply_to_message_id=task.message_id,
-                reply_markup=keyboard,
-            )
-            logger.info(f"Отправлено сообщение с выбором языка для {task.task_id}")
-        except TelegramBadRequest as e:
-            logger.error(f"Не удалось отправить сообщение с кнопками: {e}")
-            # Удаляем из хранилища если не удалось отправить
-            pending_store.remove(task.task_id)
-
     async def _send_result(
         self, task: VoiceTask, result: dict, processing_time: float
     ) -> None:
         """
-        Отправить результат распознавания и выполнить запрошенное действие (создание или редактирование).
+        Отправить результат распознавания и выполнить запрошенное действие.
 
         Args:
             task: Задача
@@ -269,11 +197,7 @@ class QueueManager:
             await self._handle_edit_action(task, result, processing_time)
             return
 
-        # Иначе - стандартное создание (create)
-
-        # Определяем был ли ручной выбор языка
-        manual = task.task_id in pending_store._claimed or pending_store.get_claimer(task.task_id) is not None
-        username = pending_store.get_claimer(task.task_id)
+        # Стандартное создание (create)
 
         # Собираем фотографии за последние 3 минуты
         photo_file_ids = []
@@ -282,41 +206,35 @@ class QueueManager:
             if photo_file_ids:
                 logger.info(f"Собрано {len(photo_file_ids)} фото для задачи {task.task_id}")
 
-        # Пробуем сразу сформировать задачу через Gemini
-        if config.GEMINI_API_KEY:
+        # Пробуем сформировать задачу через LLM (Gemini или Groq)
+        llm_available = (config.CARD_PROVIDER == "groq") or (config.CARD_PROVIDER == "gemini" and config.GEMINI_API_KEY)
+        if llm_available:
             try:
-                # Отправляем сообщение о генерации
                 generating_msg = await self.bot.send_message(
                     chat_id=task.chat_id,
                     text=get_trello_generating_message(),
                     reply_to_message_id=task.message_id,
                 )
 
-                # Генерируем задачу через Gemini
-                from utils.trello_gemini import generate_trello_card
-                logger.info(f"Вызов Gemini для задачи {task.task_id}")
-                card_data = generate_trello_card(result["text"])
-                logger.info(f"Gemini вернул: {card_data}")
+                from utils.trello_llm import generate_trello_card
+                logger.info(f"Вызов LLM [{config.CARD_PROVIDER}] для задачи {task.task_id}")
+                card_data = generate_trello_card(result["text"], user_id=task.user_id)
+                logger.info(f"LLM вернул: {card_data}")
 
-                # Удаляем сообщение о генерации
                 try:
                     await generating_msg.delete()
                 except Exception:
                     pass
 
                 if card_data:
-                    # Добавляем photo_file_ids к данным задачи
                     card_data["photo_file_ids"] = photo_file_ids
-
-                    # Сохраняем задачу в памяти
                     card_id = _store_card(card_data)
                     logger.info(f"Задача сохранена: card_id={card_id}, title={card_data['title']}")
 
-                    # Отправляем задачу с кнопками подтверждения
                     keyboard = create_trello_confirm_keyboard(card_id)
                     await self.bot.send_message(
                         chat_id=task.chat_id,
-                        text=get_trello_card_message(card_data["title"], card_data["description"]),
+                        text=get_trello_card_message(card_data["title"], card_data["description"], card_data.get("deadline"), card_data.get("assignee")),
                         reply_to_message_id=task.message_id,
                         reply_markup=keyboard,
                     )
@@ -338,10 +256,8 @@ class QueueManager:
         # Fallback: если Gemini не настроен — отправляем только расшифровку
         text = get_success_message(
             text=result["text"],
-            lang=task.lang or "unknown",
+            lang=task.lang or "",
             processing_time=processing_time,
-            manual=manual,
-            username=username,
         )
 
         try:
@@ -361,7 +277,7 @@ class QueueManager:
         """
         logger.info(f"=== _handle_edit_action: task_id={task.task_id}")
         card_id = task.action_data.get("card_id") if task.action_data else None
-        
+
         if not card_id:
             logger.error("Нет card_id в task.action_data")
             await self._send_error(task)
@@ -375,7 +291,6 @@ class QueueManager:
             await self._send_error(task)
             return
 
-        # Если распознавание пустое (тишина)
         if not result.get("text"):
             await self.bot.send_message(
                 chat_id=task.chat_id,
@@ -384,16 +299,14 @@ class QueueManager:
             )
             return
 
-        # Отправляем сообщение о генерации
         generating_msg = await self.bot.send_message(
             chat_id=task.chat_id,
             text=get_trello_generating_message(),
             reply_to_message_id=task.message_id,
         )
 
-        from utils.trello_gemini import edit_trello_card
-        # Редактируем карточку через Gemini
-        edited_card_data = edit_trello_card(original_card_data, result["text"])
+        from utils.trello_llm import edit_trello_card
+        edited_card_data = edit_trello_card(original_card_data, result["text"], user_id=task.user_id)
 
         try:
             await generating_msg.delete()
@@ -404,19 +317,17 @@ class QueueManager:
             await self._send_gemini_error(task, result["text"], original_card_data.get("photo_file_ids", []))
             return
 
-        # Сохраняем фото файлы из оригинала
         edited_card_data["photo_file_ids"] = original_card_data.get("photo_file_ids", [])
-        
-        # Обновляем в хранилище
         _pending_cards[card_id] = edited_card_data
 
-        # Отправляем обновлённую карточку с кнопкой "✅ В Trello"
         keyboard = create_trello_confirm_keyboard(card_id)
         await self.bot.send_message(
             chat_id=task.chat_id,
             text=get_trello_card_message(
                 edited_card_data["title"],
-                edited_card_data["description"]
+                edited_card_data["description"],
+                edited_card_data.get("deadline"),
+                edited_card_data.get("assignee"),
             ),
             reply_to_message_id=task.message_id,
             reply_markup=keyboard,
@@ -448,7 +359,7 @@ class QueueManager:
 
     async def _send_error(self, task: VoiceTask) -> None:
         """
-        Отправить сообщение об ошибке (STT или система).
+        Отправить сообщение об ошибке.
 
         Args:
             task: Задача

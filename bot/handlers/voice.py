@@ -2,18 +2,15 @@
 
 import uuid
 from datetime import datetime
-from pathlib import Path
 
 from aiogram import F, Router
 from aiogram.types import Message, Voice
 
-from bot.keyboards import create_language_keyboard
 from bot.messages import get_queue_message
 from config import config
 from loguru import logger
 from task_queue.manager import QueueManager
 from task_queue.task import TaskStatus, VoiceTask
-from storage.pending import pending_store
 
 router = Router(name="voice")
 

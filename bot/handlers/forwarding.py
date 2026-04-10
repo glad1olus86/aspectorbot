@@ -102,7 +102,7 @@ async def forward_cancel_callback(callback: CallbackQuery) -> None:
         
     from bot.keyboards import create_trello_confirm_keyboard
     await callback.message.edit_text(
-        get_trello_card_message(card_data["title"], card_data["description"]),
+        get_trello_card_message(card_data["title"], card_data["description"], card_data.get("deadline"), card_data.get("assignee")),
         reply_markup=create_trello_confirm_keyboard(card_id),
     )
     await callback.answer()

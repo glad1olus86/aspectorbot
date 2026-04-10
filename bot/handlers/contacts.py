@@ -15,6 +15,7 @@ router = Router(name="contacts")
 class ContactState(StatesGroup):
     waiting_for_name = State()
     waiting_for_username = State()
+    waiting_for_triggers = State()
 
 
 def _build_contacts_keyboard(owner_id: int, page: int = 0) -> InlineKeyboardMarkup:
@@ -129,10 +130,12 @@ async def contact_view_callback(callback: CallbackQuery) -> None:
         await callback.answer("❌ Контакт не найден", show_alert=True)
         return
         
+    triggers_line = ", ".join(contact.trigger_words) if contact.trigger_words else "—"
     text = (
         f"👤 <b>Профиль контакта</b>\n\n"
         f"<b>Имя:</b> {contact.name}\n"
         f"<b>Username:</b> @{contact.username}\n"
+        f"<b>Триггер-слова:</b> {triggers_line}\n"
         f"<b>Задач отправлено:</b> {contact.tasks_sent}\n"
     )
     
@@ -201,8 +204,7 @@ async def process_contact_name(message: Message, state: FSMContext) -> None:
     text = (
         f"➕ <b>Добавление контакта</b>\n"
         f"Имя: {name}\n\n"
-        f"Теперь введите Telegram Username (начинается с @) этого человека.\n\n"
-        f"<i>Внимание: Бот сможет отправить ему задачу только если этот человек хотя бы раз нажимал /start в диалоге с ботом.</i>"
+        f"Теперь введите Telegram Username (начинается с @) этого человека:"
     )
     buttons = [[InlineKeyboardButton(text="❌ Отмена", callback_data="contact_cancel")]]
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -225,30 +227,82 @@ async def process_contact_name(message: Message, state: FSMContext) -> None:
 
 @router.message(ContactState.waiting_for_username)
 async def process_contact_username(message: Message, state: FSMContext) -> None:
-    """Обработка ввода юзернейма и сохранение контакта."""
+    """Обработка ввода юзернейма — переход к триггер-словам."""
     username = message.text.strip()
-    
+
     # Базовая валидация юзернейма
     if not username.startswith("@") and " " in username:
         await message.answer("⚠️ Введите корректный Telegram Username (например: @ivan_dev). Попробуйте снова:")
         return
-        
-    data = await state.get_data()
-    name = data.get("contact_name")
-    user_id = message.from_user.id
-    
-    contacts_store.add_contact(user_id, name, username)
-    await state.clear()
-    
+
+    await state.update_data(contact_username=username)
+    await state.set_state(ContactState.waiting_for_triggers)
+
     try:
         await message.delete()
     except Exception:
         pass
-        
+
+    data = await state.get_data()
+    name = data.get("contact_name")
+    menu_message_id = data.get("menu_message_id")
+
+    text = (
+        f"➕ <b>Добавление контакта</b>\n"
+        f"Имя: {name}\n"
+        f"Username: {username}\n\n"
+        f"Введите <b>триггер-слова</b> через запятую — по ним бот будет определять, "
+        f"что задача предназначена этому человеку.\n\n"
+        f"Пример: <code>вася, василий, васька</code>\n\n"
+        f"Или отправьте <code>-</code> чтобы пропустить."
+    )
+    buttons = [[InlineKeyboardButton(text="❌ Отмена", callback_data="contact_cancel")]]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    if menu_message_id:
+        try:
+            await message.bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=menu_message_id,
+                text=text,
+                reply_markup=keyboard,
+            )
+        except Exception:
+            msg = await message.answer(text, reply_markup=keyboard)
+            await state.update_data(menu_message_id=msg.message_id)
+    else:
+        msg = await message.answer(text, reply_markup=keyboard)
+        await state.update_data(menu_message_id=msg.message_id)
+
+
+@router.message(ContactState.waiting_for_triggers)
+async def process_contact_triggers(message: Message, state: FSMContext) -> None:
+    """Обработка триггер-слов и сохранение контакта."""
+    raw = message.text.strip()
+
+    # Парсим триггер-слова
+    if raw == "-":
+        trigger_words = []
+    else:
+        trigger_words = [w.strip() for w in raw.split(",") if w.strip()]
+
+    data = await state.get_data()
+    name = data.get("contact_name")
+    username = data.get("contact_username")
+    user_id = message.from_user.id
+
+    contacts_store.add_contact(user_id, name, username, trigger_words)
+    await state.clear()
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
     menu_message_id = data.get("menu_message_id")
     text = "🗓 <b>Ваши контакты</b>\n\n✅ Контакт успешно добавлен."
     keyboard = _build_contacts_keyboard(user_id, 0)
-    
+
     if menu_message_id:
         try:
             await message.bot.edit_message_text(

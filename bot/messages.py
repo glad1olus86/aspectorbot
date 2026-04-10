@@ -1,7 +1,5 @@
 """Шаблоны сообщений для бота."""
 
-from config import config
-
 
 def get_start_message_private() -> str:
     """
@@ -10,19 +8,10 @@ def get_start_message_private() -> str:
     Returns:
         Текст сообщения /start
     """
-    languages = config.SUPPORTED_LANGUAGES
-    flags = config.LANGUAGE_FLAGS
-
-    lang_list = " · ".join(
-        f"{flags.get(code, '')} {name}" for code, name in languages.items()
-    )
-
-    return f"""👋 Привет! Я Aspector STT — бот для расшифровки голосовых сообщений.
+    return """👋 Привет! Я Aspector STT — бот для расшифровки голосовых сообщений.
 
 🎙️ Просто отправь мне голосовое, и я переведу его в текст.
-Поддерживаю: {lang_list}
-
-Язык определяется автоматически."""
+Язык определяется автоматически (Whisper)."""
 
 
 def get_start_message_group() -> str:
@@ -49,56 +38,28 @@ def get_help_message() -> str:
 
 **Как использовать:**
 1. Отправьте мне голосовое сообщение
-2. Я автоматически определю язык
-3. Отправлю вам текстовую расшифровку
-
-**Если язык не определился:**
-• Я отправлю кнопки с выбором языка
-• Нажать может любой участник чата
-• После выбора я расшифрую сообщение
-
-**Поддерживаемые языки:**
-🇷🇺 Русский
-🇺🇸 English
-🇺🇦 Українська
-🇨🇿 Čeština
+2. Я автоматически определю язык и расшифрую
 
 **Команды:**
 /start — Запустить бота
-/help — Эта справка
-/lang — Выбрать язык (пропускает автоопределение)
-
-Работаю полностью офлайн — ваши данные не отправляются на сторонние серверы."""
+/help — Эта справка"""
 
 
 def get_success_message(
-    text: str, lang: str, processing_time: float, manual: bool = False, username: str | None = None
+    text: str, lang: str, processing_time: float
 ) -> str:
     """
     Получить сообщение с результатом распознавания.
 
     Args:
         text: Распознанный текст
-        lang: Код языка
+        lang: Код языка (из Whisper)
         processing_time: Время обработки в секундах
-        manual: Был ли язык выбран вручную
-        username: Username пользователя который выбрал язык
 
     Returns:
         Текст сообщения с расшифровкой
     """
-    languages = config.SUPPORTED_LANGUAGES
-    flags = config.LANGUAGE_FLAGS
-
-    lang_name = languages.get(lang, lang)
-    flag = flags.get(lang, "")
-
-    if manual:
-        lang_info = f"✅ Язык выбран вручную: {flag} {lang_name}"
-        if username:
-            lang_info += f" (выбрал @{username})"
-    else:
-        lang_info = f"🌍 Язык определён автоматически: {flag} {lang_name}"
+    lang_info = f"🌍 Язык: {lang}" if lang else ""
 
     return f"""🎤 Расшифровка ГС:
 
@@ -106,36 +67,6 @@ def get_success_message(
 
 {lang_info}
 ⏱️ Время обработки: {processing_time:.1f} сек"""
-
-
-def get_pending_language_message() -> str:
-    """
-    Получить сообщение когда не удалось определить язык.
-
-    Returns:
-        Текст сообщения с просьбой выбрать язык
-    """
-    return """🤔 Не удалось автоматически определить язык голосового.
-
-Выберите язык — и я расшифрую:"""
-
-
-def get_language_selected_message(username: str | None = None) -> str:
-    """
-    Получить сообщение после выбора языка (для редактирования).
-
-    Args:
-        username: Username пользователя который выбрал язык
-
-    Returns:
-        Текст сообщения с подтверждением выбора
-    """
-    base = "🤔 Не удалось автоматически определить язык голосового.\n\n"
-
-    if username:
-        return f"{base}✅ Язык выбран: @{username}"
-    else:
-        return f"{base}✅ Язык выбран"
 
 
 def get_error_message() -> str:
@@ -150,7 +81,6 @@ def get_error_message() -> str:
 Возможные причины:
 • Слишком много шума в записи
 • Очень короткое или тихое сообщение
-• Язык не входит в список поддерживаемых
 
 Попробуй записать ещё раз."""
 
@@ -189,23 +119,32 @@ def get_trello_generating_message() -> str:
     return "🤖 Формирую задачу..."
 
 
-def get_trello_card_message(title: str, description: str) -> str:
+def get_trello_card_message(
+    title: str, description: str, deadline: str | None = None, assignee: str | None = None
+) -> str:
     """
     Получить сообщение с готовой задачей.
 
     Args:
         title: Заголовок задачи
         description: Описание задачи
+        deadline: Дедлайн (строка) или None
+        assignee: @username исполнителя или None
 
     Returns:
         Текст сообщения с задачей
     """
+    extra = ""
+    if assignee:
+        extra += f"\n👷 <b>Исполнитель:</b> {assignee}"
+    if deadline:
+        extra += f"\n⏰ <b>Дедлайн:</b> {deadline}"
     return f"""📋 Задача:
 
 <b>Тема:</b> {title}
 
 <b>Описание:</b>
-{description}"""
+{description}{extra}"""
 
 
 def get_trello_edit_prompt_message() -> str:
@@ -266,13 +205,104 @@ def get_trello_error_message() -> str:
 Попробуйте ещё раз или обратитесь к администратору."""
 
 
+# ─── Сообщения для групповых задач ──────────────────────────────────────
+
+
+def get_group_task_pending_message(
+    title: str,
+    description: str,
+    creator_username: str | None,
+    deadline: str | None = None,
+    assignee: str | None = None,
+) -> str:
+    """Сообщение задачи в группе — статус: ожидает."""
+    author = f"@{creator_username}" if creator_username else "Неизвестный"
+    mention = f"{assignee}, тебе задача!\n\n" if assignee else ""
+    assignee_line = f"\n👷 Назначено: {assignee}" if assignee else ""
+    deadline_line = f"\n⏰ Дедлайн: {deadline}" if deadline else ""
+    return f"""{mention}📋 <b>Задача</b>
+
+<b>Тема:</b> {title}
+
+<b>Описание:</b>
+{description}
+
+━━━━━━━━━━━━━━━━
+⏳ <b>Статус:</b> Ожидает
+
+👤 Автор: {author}{assignee_line}{deadline_line}"""
+
+
+def get_group_task_in_progress_message(
+    title: str,
+    description: str,
+    creator_username: str | None,
+    worker_username: str | None,
+    deadline_str: str,
+) -> str:
+    """Сообщение задачи в группе — статус: в работе."""
+    author = f"@{creator_username}" if creator_username else "Неизвестный"
+    worker = f"@{worker_username}" if worker_username else "Неизвестный"
+    return f"""📋 <b>Задача</b>
+
+<b>Тема:</b> {title}
+
+<b>Описание:</b>
+{description}
+
+━━━━━━━━━━━━━━━━
+🔵 <b>Статус:</b> В работе
+
+👤 Автор: {author}
+👷 Исполнитель: {worker}
+⏰ Дедлайн: {deadline_str}"""
+
+
+def get_group_task_done_message(
+    title: str,
+    description: str,
+    creator_username: str | None,
+    worker_username: str | None,
+    completed_str: str,
+) -> str:
+    """Сообщение задачи в группе — статус: выполнено."""
+    author = f"@{creator_username}" if creator_username else "Неизвестный"
+    worker = f"@{worker_username}" if worker_username else "Неизвестный"
+    return f"""📋 <b>Задача</b>
+
+<b>Тема:</b> {title}
+
+<b>Описание:</b>
+{description}
+
+━━━━━━━━━━━━━━━━
+✅ <b>Статус:</b> Выполнено
+
+👤 Автор: {author}
+👷 Исполнитель: {worker}
+🕐 Выполнено: {completed_str}"""
+
+
+def get_task_completed_dm_message(
+    title: str,
+    worker_username: str | None,
+    completed_str: str,
+) -> str:
+    """Уведомление автору в ЛС о выполнении задачи."""
+    worker = f"@{worker_username}" if worker_username else "Неизвестный"
+    return f"""✅ <b>Задача выполнена!</b>
+
+<b>Тема:</b> {title}
+
+👷 Выполнил: {worker}
+🕐 Время: {completed_str}"""
+
+
 __all__ = [
     "get_start_message_private",
     "get_start_message_group",
     "get_help_message",
     "get_success_message",
-    "get_pending_language_message",
-    "get_language_selected_message",
     "get_error_message",
     "get_queue_message",
     "get_processing_message",
@@ -282,4 +312,8 @@ __all__ = [
     "get_trello_created_message",
     "get_trello_error_message",
     "get_trello_cancelled_message",
+    "get_group_task_pending_message",
+    "get_group_task_in_progress_message",
+    "get_group_task_done_message",
+    "get_task_completed_dm_message",
 ]

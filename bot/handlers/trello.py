@@ -21,7 +21,7 @@ from bot.messages import (
     get_trello_generating_message,
 )
 from utils.trello_client import trello_client
-from utils.trello_gemini import edit_trello_card, generate_trello_card
+from utils.trello_llm import edit_trello_card, generate_trello_card
 
 router = Router(name="trello")
 
@@ -116,7 +116,7 @@ async def retry_gemini_callback(callback: CallbackQuery) -> None:
             await callback.answer("⏳ Исходная задача устарела.", show_alert=True)
             return
             
-        card_data = await asyncio.to_thread(edit_trello_card, orig_card, task_data["text"])
+        card_data = await asyncio.to_thread(edit_trello_card, orig_card, task_data["text"], callback.from_user.id)
         if card_data:
             # Восстанавливаем фото из сохраненных провалившихся данных
             card_data["photo_file_ids"] = task_data.get("photo_file_ids", [])
@@ -124,7 +124,7 @@ async def retry_gemini_callback(callback: CallbackQuery) -> None:
             
             await generating_msg.delete()
             await callback.message.reply(
-                get_trello_card_message(card_data["title"], card_data["description"]),
+                get_trello_card_message(card_data["title"], card_data["description"], card_data.get("deadline"), card_data.get("assignee")),
                 reply_markup=create_trello_confirm_keyboard(card_id),
             )
             _failed_tasks.pop(failed_id, None)
@@ -139,7 +139,7 @@ async def retry_gemini_callback(callback: CallbackQuery) -> None:
             await callback.answer("Снова ошибка Gemini")
     else:
         # Стандартное создание
-        card_data = await asyncio.to_thread(generate_trello_card, task_data["text"])
+        card_data = await asyncio.to_thread(generate_trello_card, task_data["text"], callback.from_user.id)
         
         await generating_msg.delete()
         if card_data:
@@ -147,7 +147,7 @@ async def retry_gemini_callback(callback: CallbackQuery) -> None:
             card_id = _store_card(card_data)
             
             await callback.message.reply(
-                get_trello_card_message(card_data["title"], card_data["description"]),
+                get_trello_card_message(card_data["title"], card_data["description"], card_data.get("deadline"), card_data.get("assignee")),
                 reply_markup=create_trello_confirm_keyboard(card_id),
             )
             _failed_tasks.pop(failed_id, None)
@@ -309,7 +309,7 @@ async def trello_edits_message(message: Message, state: FSMContext) -> None:
     generating_msg = await message.answer(get_trello_generating_message())
 
     # Редактируем карточку через Gemini
-    edited_card_data = edit_trello_card(original_card_data, edits)
+    edited_card_data = edit_trello_card(original_card_data, edits, user_id=message.from_user.id)
 
     # Удаляем сообщение о генерации
     await generating_msg.delete()
@@ -330,6 +330,8 @@ async def trello_edits_message(message: Message, state: FSMContext) -> None:
         get_trello_card_message(
             edited_card_data["title"],
             edited_card_data["description"],
+            edited_card_data.get("deadline"),
+            edited_card_data.get("assignee"),
         ),
         reply_markup=create_trello_confirm_keyboard(card_id),
     )
